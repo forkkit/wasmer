@@ -1,6 +1,9 @@
 use super::stackmap::StackmapRegistry;
-use crate::intrinsics::Intrinsics;
-use crate::structs::{Callbacks, LLVMModule, LLVMResult, MemProtect};
+use crate::{
+    intrinsics::Intrinsics,
+    structs::{Callbacks, LLVMModule, LLVMResult, MemProtect},
+    LLVMCallbacks,
+};
 use inkwell::{
     memory_buffer::MemoryBuffer,
     module::Module,
@@ -9,12 +12,12 @@ use inkwell::{
 use libc::c_char;
 use std::{
     any::Any,
+    cell::RefCell,
     ffi::{c_void, CString},
-    fs::File,
-    io::Write,
     mem,
     ops::Deref,
     ptr::{self, NonNull},
+    rc::Rc,
     slice, str,
     sync::{Arc, Once},
 };
@@ -27,7 +30,7 @@ use wasmer_runtime_core::{
     module::ModuleInfo,
     state::ModuleStateMap,
     structures::TypedIndex,
-    typed_func::{Wasm, WasmTrapInfo},
+    typed_func::{Trampoline, Wasm, WasmTrapInfo},
     types::{LocalFuncIndex, SigIndex},
     vm, vmcalls,
 };
@@ -57,13 +60,13 @@ extern "C" {
 
     #[allow(improper_ctypes)]
     fn invoke_trampoline(
-        trampoline: unsafe extern "C" fn(*mut vm::Ctx, NonNull<vm::Func>, *const u64, *mut u64),
+        trampoline: Trampoline,
         vmctx_ptr: *mut vm::Ctx,
         func_ptr: NonNull<vm::Func>,
         params: *const u64,
         results: *mut u64,
         trap_out: *mut WasmTrapInfo,
-        user_error: *mut Option<Box<dyn Any>>,
+        user_error: *mut Option<Box<dyn Any + Send>>,
         invoke_env: Option<NonNull<c_void>>,
     ) -> bool;
 }
@@ -167,28 +170,27 @@ pub struct LLVMBackend {
 
 impl LLVMBackend {
     pub fn new(
-        module: Module,
+        module: Rc<RefCell<Module>>,
         _intrinsics: Intrinsics,
         _stackmaps: &StackmapRegistry,
         _module_info: &ModuleInfo,
         target_machine: &TargetMachine,
+        llvm_callbacks: &Option<Rc<RefCell<dyn LLVMCallbacks>>>,
     ) -> (Self, LLVMCache) {
         let memory_buffer = target_machine
-            .write_to_memory_buffer(&module, FileType::Object)
+            .write_to_memory_buffer(&module.borrow_mut(), FileType::Object)
             .unwrap();
-        let mem_buf_slice = memory_buffer.as_slice();
 
-        if let Some(path) = unsafe { &crate::GLOBAL_OPTIONS.obj_file } {
-            let mut file = File::create(path).unwrap();
-            let mut pos = 0;
-            while pos < mem_buf_slice.len() {
-                pos += file.write(&mem_buf_slice[pos..]).unwrap();
-            }
+        if let Some(callbacks) = llvm_callbacks {
+            callbacks
+                .borrow_mut()
+                .obj_memory_buffer_callback(&memory_buffer);
         }
 
         let callbacks = get_callbacks();
         let mut module: *mut LLVMModule = ptr::null_mut();
 
+        let mem_buf_slice = memory_buffer.as_slice();
         let res = unsafe {
             module_load(
                 mem_buf_slice.as_ptr(),
@@ -387,12 +389,7 @@ impl RunnableModule for LLVMBackend {
     }
 
     fn get_trampoline(&self, _: &ModuleInfo, sig_index: SigIndex) -> Option<Wasm> {
-        let trampoline: unsafe extern "C" fn(
-            *mut vm::Ctx,
-            NonNull<vm::Func>,
-            *const u64,
-            *mut u64,
-        ) = unsafe {
+        let trampoline: Trampoline = unsafe {
             let name = if cfg!(target_os = "macos") {
                 format!("_trmp{}", sig_index.index())
             } else {
@@ -430,7 +427,7 @@ impl RunnableModule for LLVMBackend {
         self.msm.clone()
     }
 
-    unsafe fn do_early_trap(&self, data: Box<dyn Any>) -> ! {
+    unsafe fn do_early_trap(&self, data: Box<dyn Any + Send>) -> ! {
         throw_any(Box::leak(data))
     }
 }

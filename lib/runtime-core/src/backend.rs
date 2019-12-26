@@ -28,6 +28,7 @@ pub enum Backend {
     Cranelift,
     Singlepass,
     LLVM,
+    Auto,
 }
 
 impl Backend {
@@ -40,6 +41,7 @@ impl Backend {
             "singlepass",
             #[cfg(feature = "backend-llvm")]
             "llvm",
+            "auto",
         ]
     }
 
@@ -50,6 +52,7 @@ impl Backend {
             Backend::Cranelift => "cranelift",
             Backend::Singlepass => "singlepass",
             Backend::LLVM => "llvm",
+            Backend::Auto => "auto",
         }
     }
 }
@@ -67,9 +70,38 @@ impl std::str::FromStr for Backend {
             "singlepass" => Ok(Backend::Singlepass),
             "cranelift" => Ok(Backend::Cranelift),
             "llvm" => Ok(Backend::LLVM),
+            "auto" => Ok(Backend::Auto),
             _ => Err(format!("The backend {} doesn't exist", s)),
         }
     }
+}
+
+/// The target architecture for code generation.
+#[derive(Copy, Clone, Debug)]
+pub enum Architecture {
+    /// x86-64.
+    X64,
+
+    /// Aarch64 (ARM64).
+    Aarch64,
+}
+
+/// The type of an inline breakpoint.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug)]
+pub enum InlineBreakpointType {
+    /// A middleware invocation breakpoint.
+    Middleware,
+}
+
+/// Information of an inline breakpoint.
+#[derive(Clone, Debug)]
+pub struct InlineBreakpoint {
+    /// Size in bytes taken by this breakpoint's instruction sequence.
+    pub size: usize,
+
+    /// Type of the inline breakpoint.
+    pub ty: InlineBreakpointType,
 }
 
 #[cfg(test)]
@@ -120,6 +152,19 @@ pub struct Features {
     pub threads: bool,
 }
 
+/// Use this to point to a compiler config struct provided by the backend.
+/// The backend struct must support runtime reflection with `Any`, which is any
+/// struct that does not contain a non-`'static` reference.
+#[derive(Debug)]
+pub struct BackendCompilerConfig(pub Box<dyn Any + 'static>);
+
+impl BackendCompilerConfig {
+    /// Obtain the backend-specific compiler config struct.
+    pub fn get_specific<T: 'static>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+}
+
 /// Configuration data for the compiler
 #[derive(Debug, Default)]
 pub struct CompilerConfig {
@@ -129,6 +174,13 @@ pub struct CompilerConfig {
     pub enforce_stack_check: bool,
     pub track_state: bool,
     pub features: Features,
+
+    // Target info. Presently only supported by LLVM.
+    pub triple: Option<String>,
+    pub cpu_name: Option<String>,
+    pub cpu_features: Option<String>,
+
+    pub backend_specific_config: Option<BackendCompilerConfig>,
 }
 
 pub trait Compiler {
@@ -171,7 +223,7 @@ pub trait RunnableModule: Send + Sync {
     /// signature and an invoke function that can call the trampoline.
     fn get_trampoline(&self, info: &ModuleInfo, sig_index: SigIndex) -> Option<Wasm>;
 
-    unsafe fn do_early_trap(&self, data: Box<dyn Any>) -> !;
+    unsafe fn do_early_trap(&self, data: Box<dyn Any + Send>) -> !;
 
     /// Returns the machine code associated with this module.
     fn get_code(&self) -> Option<&[u8]> {
@@ -185,6 +237,23 @@ pub trait RunnableModule: Send + Sync {
 
     /// Returns the beginning offsets of all local functions.
     fn get_local_function_offsets(&self) -> Option<Vec<usize>> {
+        None
+    }
+
+    /// Returns the inline breakpoint size corresponding to an Architecture (None in case is not implemented)
+    fn get_inline_breakpoint_size(&self, _arch: Architecture) -> Option<usize> {
+        None
+    }
+
+    /// Attempts to read an inline breakpoint from the code.
+    ///
+    /// Inline breakpoints are detected by special instruction sequences that never
+    /// appear in valid code.
+    fn read_inline_breakpoint(
+        &self,
+        _arch: Architecture,
+        _code: &[u8],
+    ) -> Option<InlineBreakpoint> {
         None
     }
 }

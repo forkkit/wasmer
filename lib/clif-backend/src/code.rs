@@ -11,9 +11,9 @@ use cranelift_codegen::ir::{self, Ebb, Function, InstBuilder};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::{cursor::FuncCursor, isa};
 use cranelift_frontend::{FunctionBuilder, Position, Variable};
-use cranelift_wasm::{self, FuncTranslator};
+use cranelift_wasm::{self, FuncTranslator, ModuleTranslationState};
 use cranelift_wasm::{get_vmctx_value_label, translate_operator};
-use cranelift_wasm::{FuncEnvironment, ReturnMode, WasmError};
+use cranelift_wasm::{FuncEnvironment, ReturnMode, TargetEnvironment, WasmError};
 use std::mem;
 use std::sync::{Arc, RwLock};
 use wasmer_runtime_core::error::CompileError;
@@ -52,6 +52,10 @@ impl ModuleCodeGenerator<CraneliftFunctionCodeGenerator, Caller, CodegenError>
             function_signatures: None,
             signatures: None,
         }
+    }
+
+    fn new_with_target(_: Option<String>, _: Option<String>, _: Option<String>) -> Self {
+        unimplemented!("cross compilation is not available for clif backend")
     }
 
     fn backend_id() -> Backend {
@@ -243,7 +247,7 @@ pub struct FunctionEnvironment {
     clif_signatures: Map<SigIndex, ir::Signature>,
 }
 
-impl FuncEnvironment for FunctionEnvironment {
+impl TargetEnvironment for FunctionEnvironment {
     /// Gets configuration information needed for compiling functions
     fn target_config(&self) -> isa::TargetFrontendConfig {
         self.target_config
@@ -261,6 +265,13 @@ impl FuncEnvironment for FunctionEnvironment {
         self.target_config().pointer_bytes()
     }
 
+    /// Return Cranelift reference type.
+    fn reference_type(&self) -> ir::Type {
+        ir::types::R64
+    }
+}
+
+impl FuncEnvironment for FunctionEnvironment {
     /// Sets up the necessary preamble definitions in `func` to access the global identified
     /// by `index`.
     ///
@@ -691,7 +702,9 @@ impl FuncEnvironment for FunctionEnvironment {
     }
 
     /// Generates a call IR with `callee` and `call_args` and inserts it at `pos`
-    /// TODO: add support for imported functions
+    ///
+    /// It's about generating code that calls a local or imported function; in
+    /// WebAssembly: `(call $foo)`.
     fn translate_call(
         &mut self,
         mut pos: FuncCursor,
@@ -763,20 +776,31 @@ impl FuncEnvironment for FunctionEnvironment {
                     readonly: true,
                 });
 
-                let imported_vmctx_addr = pos.func.create_global_value(ir::GlobalValueData::Load {
-                    base: imported_func_struct_addr,
-                    offset: (vm::ImportedFunc::offset_vmctx() as i32).into(),
-                    global_type: ptr_type,
-                    readonly: true,
-                });
+                let imported_func_ctx_addr =
+                    pos.func.create_global_value(ir::GlobalValueData::Load {
+                        base: imported_func_struct_addr,
+                        offset: (vm::ImportedFunc::offset_func_ctx() as i32).into(),
+                        global_type: ptr_type,
+                        readonly: true,
+                    });
+
+                let imported_func_ctx_vmctx_addr =
+                    pos.func.create_global_value(ir::GlobalValueData::Load {
+                        base: imported_func_ctx_addr,
+                        offset: (vm::FuncCtx::offset_vmctx() as i32).into(),
+                        global_type: ptr_type,
+                        readonly: true,
+                    });
 
                 let imported_func_addr = pos.ins().global_value(ptr_type, imported_func_addr);
-                let imported_vmctx_addr = pos.ins().global_value(ptr_type, imported_vmctx_addr);
+                let imported_func_ctx_vmctx_addr = pos
+                    .ins()
+                    .global_value(ptr_type, imported_func_ctx_vmctx_addr);
 
                 let sig_ref = pos.func.dfg.ext_funcs[callee].signature;
 
                 let mut args = Vec::with_capacity(call_args.len() + 1);
-                args.push(imported_vmctx_addr);
+                args.push(imported_func_ctx_vmctx_addr);
                 args.extend(call_args.iter().cloned());
 
                 Ok(pos
@@ -785,7 +809,6 @@ impl FuncEnvironment for FunctionEnvironment {
             }
         }
     }
-
     /// Generates code corresponding to wasm `memory.grow`.
     ///
     /// `index` refers to the linear memory to query.
@@ -914,6 +937,94 @@ impl FuncEnvironment for FunctionEnvironment {
 
         Ok(*pos.func.dfg.inst_results(call_inst).first().unwrap())
     }
+    fn translate_memory_copy(
+        &mut self,
+        _pos: FuncCursor,
+        _clif_mem_index: cranelift_wasm::MemoryIndex,
+        _heap: ir::Heap,
+        _dst: ir::Value,
+        _src: ir::Value,
+        _len: ir::Value,
+    ) -> cranelift_wasm::WasmResult<()> {
+        unimplemented!("memory.copy not yet implemented");
+    }
+
+    fn translate_memory_fill(
+        &mut self,
+        _pos: FuncCursor,
+        _clif_mem_index: cranelift_wasm::MemoryIndex,
+        _heap: ir::Heap,
+        _dst: ir::Value,
+        _val: ir::Value,
+        _len: ir::Value,
+    ) -> cranelift_wasm::WasmResult<()> {
+        unimplemented!("memory.fill not yet implemented");
+    }
+
+    fn translate_memory_init(
+        &mut self,
+        _pos: FuncCursor,
+        _clif_mem_index: cranelift_wasm::MemoryIndex,
+        _heap: ir::Heap,
+        _seg_index: u32,
+        _dst: ir::Value,
+        _src: ir::Value,
+        _len: ir::Value,
+    ) -> cranelift_wasm::WasmResult<()> {
+        unimplemented!("memory.init not yet implemented");
+    }
+
+    fn translate_data_drop(
+        &mut self,
+        _pos: FuncCursor,
+        _seg_index: u32,
+    ) -> cranelift_wasm::WasmResult<()> {
+        unimplemented!("data.drop not yet implemented");
+    }
+
+    fn translate_table_size(
+        &mut self,
+        _pos: FuncCursor,
+        _index: cranelift_wasm::TableIndex,
+        _table: ir::Table,
+    ) -> cranelift_wasm::WasmResult<ir::Value> {
+        unimplemented!("table.size not yet implemented");
+    }
+
+    fn translate_table_copy(
+        &mut self,
+        _pos: FuncCursor,
+        _dst_table_index: cranelift_wasm::TableIndex,
+        _dst_table: ir::Table,
+        _src_table_index: cranelift_wasm::TableIndex,
+        _src_table: ir::Table,
+        _dst: ir::Value,
+        _src: ir::Value,
+        _len: ir::Value,
+    ) -> cranelift_wasm::WasmResult<()> {
+        unimplemented!("table.copy yet implemented");
+    }
+
+    fn translate_table_init(
+        &mut self,
+        _pos: FuncCursor,
+        _seg_index: u32,
+        _table_index: cranelift_wasm::TableIndex,
+        _table: ir::Table,
+        _dst: ir::Value,
+        _src: ir::Value,
+        _len: ir::Value,
+    ) -> cranelift_wasm::WasmResult<()> {
+        unimplemented!("table.init yet implemented");
+    }
+
+    fn translate_elem_drop(
+        &mut self,
+        _pos: FuncCursor,
+        _seg_index: u32,
+    ) -> cranelift_wasm::WasmResult<()> {
+        unimplemented!("elem.drop yet implemented");
+    }
 }
 
 impl FunctionEnvironment {
@@ -999,8 +1110,15 @@ impl FunctionCodeGenerator<CodegenError> for CraneliftFunctionCodeGenerator {
             &mut self.func_translator.func_ctx,
             &mut self.position,
         );
-        let state = &mut self.func_translator.state;
-        translate_operator(op, &mut builder, state, &mut self.func_env)?;
+        let module_state = ModuleTranslationState::new();
+        let func_state = &mut self.func_translator.state;
+        translate_operator(
+            &module_state,
+            op,
+            &mut builder,
+            func_state,
+            &mut self.func_env,
+        )?;
         Ok(())
     }
 

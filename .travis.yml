@@ -28,9 +28,18 @@ script:
 before_deploy:
   # Release
   - make release-singlepass
-  - make wapm
-  - make build-install
   - mkdir -p artifacts
+  # Make capi
+  ## Disable capi tests for now:
+  ## They are failing because trampolines are not yet implemented for ARM
+  # - make test-capi-singlepass
+  - make capi-singlepass
+  - make build-capi-package
+  - cp ./wasmer-c-api.tar.gz ./artifacts/$(./scripts/capi-name.sh)
+  # Build WAPM
+  - make build-wapm
+  # Make package
+  - make build-install-package
   - cp ./wasmer.tar.gz ./artifacts/$(./scripts/binary-name.sh)
 
 # before_deploy:

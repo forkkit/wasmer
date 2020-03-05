@@ -32,18 +32,20 @@ use std::{
 };
 
 use wasmer_runtime_core::{
-    backend::{Backend, CacheGen, CompilerConfig, Token},
+    backend::{CacheGen, CompilerConfig, Token},
     cache::{Artifact, Error as CacheError},
     codegen::*,
     memory::MemoryType,
     module::{ModuleInfo, ModuleInner},
-    parse::wp_type_to_type,
+    parse::{wp_type_to_type, LoadError},
     structures::{Map, TypedIndex},
     types::{
         FuncIndex, FuncSig, GlobalIndex, LocalOrImport, MemoryIndex, SigIndex, TableIndex, Type,
     },
 };
 use wasmparser::{BinaryReaderError, MemoryImmediate, Operator, Type as WpType};
+
+static BACKEND_ID: &str = "llvm";
 
 fn func_sig_to_llvm<'ctx>(
     context: &'ctx Context,
@@ -668,7 +670,7 @@ fn resolve_memory_ptr<'ctx>(
     memarg: &MemoryImmediate,
     ptr_ty: PointerType<'ctx>,
     value_size: usize,
-) -> Result<PointerValue<'ctx>, BinaryReaderError> {
+) -> Result<PointerValue<'ctx>, CodegenError> {
     // Look up the memory base (as pointer) and bounds (as unsigned integer).
     let memory_cache = ctx.memory(MemoryIndex::new(0), intrinsics, module.clone());
     let (mem_base, mem_bound, minimum, _maximum) = match memory_cache {
@@ -956,7 +958,6 @@ pub struct LLVMModuleCodeGenerator<'ctx> {
     intrinsics: Option<Intrinsics<'ctx>>,
     functions: Vec<LLVMFunctionCodeGenerator<'ctx>>,
     signatures: Map<SigIndex, FunctionType<'ctx>>,
-    signatures_raw: Map<SigIndex, FuncSig>,
     function_signatures: Option<Arc<Map<FuncIndex, SigIndex>>>,
     llvm_functions: Rc<RefCell<HashMap<FuncIndex, FunctionValue<'ctx>>>>,
     func_import_count: usize,
@@ -998,7 +999,7 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
         Ok(())
     }
 
-    fn feed_local(&mut self, ty: WpType, count: usize) -> Result<(), CodegenError> {
+    fn feed_local(&mut self, ty: WpType, count: usize, _loc: u32) -> Result<(), CodegenError> {
         let param_len = self.num_params;
 
         let wasmer_ty = wp_type_to_type(ty)?;
@@ -1099,7 +1100,12 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
         Ok(())
     }
 
-    fn feed_event(&mut self, event: Event, module_info: &ModuleInfo) -> Result<(), CodegenError> {
+    fn feed_event(
+        &mut self,
+        event: Event,
+        module_info: &ModuleInfo,
+        _source_loc: u32,
+    ) -> Result<(), CodegenError> {
         let mut state = &mut self.state;
         let builder = self.builder.as_ref().unwrap();
         let context = self.context.as_ref().unwrap();
@@ -1199,9 +1205,8 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
              * https://github.com/sunfishcode/wasm-reference-manual/blob/master/WebAssembly.md#control-flow-instructions
              ***************************/
             Operator::Block { ty } => {
-                let current_block = builder.get_insert_block().ok_or(BinaryReaderError {
-                    message: "not currently in a block",
-                    offset: -1isize as usize,
+                let current_block = builder.get_insert_block().ok_or(CodegenError {
+                    message: "not currently in a block".to_string(),
                 })?;
 
                 let end_block = context.append_basic_block(function, "end");
@@ -1275,9 +1280,8 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
             Operator::Br { relative_depth } => {
                 let frame = state.frame_at_depth(relative_depth)?;
 
-                let current_block = builder.get_insert_block().ok_or(BinaryReaderError {
-                    message: "not currently in a block",
-                    offset: -1isize as usize,
+                let current_block = builder.get_insert_block().ok_or(CodegenError {
+                    message: "not currently in a block".to_string(),
                 })?;
 
                 let value_len = if frame.is_loop() {
@@ -1307,9 +1311,8 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
                 let cond = state.pop1()?;
                 let frame = state.frame_at_depth(relative_depth)?;
 
-                let current_block = builder.get_insert_block().ok_or(BinaryReaderError {
-                    message: "not currently in a block",
-                    offset: -1isize as usize,
+                let current_block = builder.get_insert_block().ok_or(CodegenError {
+                    message: "not currently in a block".to_string(),
                 })?;
 
                 let value_len = if frame.is_loop() {
@@ -1339,9 +1342,8 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
                 builder.position_at_end(&else_block);
             }
             Operator::BrTable { ref table } => {
-                let current_block = builder.get_insert_block().ok_or(BinaryReaderError {
-                    message: "not currently in a block",
-                    offset: -1isize as usize,
+                let current_block = builder.get_insert_block().ok_or(CodegenError {
+                    message: "not currently in a block".to_string(),
                 })?;
 
                 let (label_depths, default_depth) = table.read_table()?;
@@ -1365,7 +1367,7 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
                     .iter()
                     .enumerate()
                     .map(|(case_index, &depth)| {
-                        let frame_result: Result<&ControlFrame, BinaryReaderError> =
+                        let frame_result: Result<&ControlFrame, CodegenError> =
                             state.frame_at_depth(depth);
                         let frame = match frame_result {
                             Ok(v) => v,
@@ -1389,9 +1391,8 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
                 state.reachable = false;
             }
             Operator::If { ty } => {
-                let current_block = builder.get_insert_block().ok_or(BinaryReaderError {
-                    message: "not currently in a block",
-                    offset: -1isize as usize,
+                let current_block = builder.get_insert_block().ok_or(CodegenError {
+                    message: "not currently in a block".to_string(),
                 })?;
                 let if_then_block = context.append_basic_block(function, "if_then");
                 let if_else_block = context.append_basic_block(function, "if_else");
@@ -1430,9 +1431,8 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
             Operator::Else => {
                 if state.reachable {
                     let frame = state.frame_at_depth(0)?;
-                    let current_block = builder.get_insert_block().ok_or(BinaryReaderError {
-                        message: "not currently in a block",
-                        offset: -1isize as usize,
+                    let current_block = builder.get_insert_block().ok_or(CodegenError {
+                        message: "not currently in a block".to_string(),
                     })?;
 
                     for phi in frame.phis().to_vec().iter().rev() {
@@ -1464,9 +1464,8 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
 
             Operator::End => {
                 let frame = state.pop_frame()?;
-                let current_block = builder.get_insert_block().ok_or(BinaryReaderError {
-                    message: "not currently in a block",
-                    offset: -1isize as usize,
+                let current_block = builder.get_insert_block().ok_or(CodegenError {
+                    message: "not currently in a block".to_string(),
                 })?;
 
                 if state.reachable {
@@ -1523,9 +1522,8 @@ impl<'ctx> FunctionCodeGenerator<CodegenError> for LLVMFunctionCodeGenerator<'ct
                 }
             }
             Operator::Return => {
-                let current_block = builder.get_insert_block().ok_or(BinaryReaderError {
-                    message: "not currently in a block",
-                    offset: -1isize as usize,
+                let current_block = builder.get_insert_block().ok_or(CodegenError {
+                    message: "not currently in a block".to_string(),
                 })?;
 
                 let frame = state.outermost_frame()?;
@@ -8610,6 +8608,14 @@ impl From<BinaryReaderError> for CodegenError {
     }
 }
 
+impl From<LoadError> for CodegenError {
+    fn from(other: LoadError) -> CodegenError {
+        CodegenError {
+            message: format!("{:?}", other),
+        }
+    }
+}
+
 impl Drop for LLVMModuleCodeGenerator<'_> {
     fn drop(&mut self) {
         // Ensure that all members of the context are dropped before we drop the context.
@@ -8709,7 +8715,6 @@ impl<'ctx> ModuleCodeGenerator<LLVMFunctionCodeGenerator<'ctx>, LLVMBackend, Cod
             module: ManuallyDrop::new(Rc::new(RefCell::new(module))),
             functions: vec![],
             signatures: Map::new(),
-            signatures_raw: Map::new(),
             function_signatures: None,
             llvm_functions: Rc::new(RefCell::new(HashMap::new())),
             func_import_count: 0,
@@ -8721,8 +8726,8 @@ impl<'ctx> ModuleCodeGenerator<LLVMFunctionCodeGenerator<'ctx>, LLVMBackend, Cod
         }
     }
 
-    fn backend_id() -> Backend {
-        Backend::LLVM
+    fn backend_id() -> &'static str {
+        BACKEND_ID
     }
 
     fn check_precondition(&mut self, _module_info: &ModuleInfo) -> Result<(), CodegenError> {
@@ -8731,7 +8736,8 @@ impl<'ctx> ModuleCodeGenerator<LLVMFunctionCodeGenerator<'ctx>, LLVMBackend, Cod
 
     fn next_function(
         &mut self,
-        _module_info: Arc<RwLock<ModuleInfo>>,
+        module_info: Arc<RwLock<ModuleInfo>>,
+        _loc: WasmSpan,
     ) -> Result<&mut LLVMFunctionCodeGenerator<'ctx>, CodegenError> {
         // Creates a new function and returns the function-scope code generator for it.
         let (context, builder, intrinsics) = match self.functions.last_mut() {
@@ -8749,7 +8755,7 @@ impl<'ctx> ModuleCodeGenerator<LLVMFunctionCodeGenerator<'ctx>, LLVMBackend, Cod
 
         let func_index = FuncIndex::new(self.func_import_count + self.functions.len());
         let sig_id = self.function_signatures.as_ref().unwrap()[func_index];
-        let func_sig = self.signatures_raw[sig_id].clone();
+        let func_sig = module_info.read().unwrap().signatures[sig_id].clone();
 
         let function = &self.llvm_functions.borrow_mut()[&func_index];
         function.set_personality_function(*self.personality_func);
@@ -8837,7 +8843,14 @@ impl<'ctx> ModuleCodeGenerator<LLVMFunctionCodeGenerator<'ctx>, LLVMBackend, Cod
     fn finalize(
         mut self,
         module_info: &ModuleInfo,
-    ) -> Result<(LLVMBackend, Box<dyn CacheGen>), CodegenError> {
+    ) -> Result<
+        (
+            LLVMBackend,
+            Option<wasmer_runtime_core::codegen::DebugMetadata>,
+            Box<dyn CacheGen>,
+        ),
+        CodegenError,
+    > {
         let (context, builder, intrinsics) = match self.functions.last_mut() {
             Some(x) => (
                 x.context.take().unwrap(),
@@ -8925,7 +8938,7 @@ impl<'ctx> ModuleCodeGenerator<LLVMFunctionCodeGenerator<'ctx>, LLVMBackend, Cod
             &self.target_machine,
             &mut self.llvm_callbacks,
         );
-        Ok((backend, Box::new(cache_gen)))
+        Ok((backend, None, Box::new(cache_gen)))
     }
 
     fn feed_compiler_config(&mut self, config: &CompilerConfig) -> Result<(), CodegenError> {
@@ -8950,7 +8963,6 @@ impl<'ctx> ModuleCodeGenerator<LLVMFunctionCodeGenerator<'ctx>, LLVMBackend, Cod
                 )
             })
             .collect();
-        self.signatures_raw = signatures.clone();
         Ok(())
     }
 
